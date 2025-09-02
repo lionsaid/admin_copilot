@@ -1,5 +1,6 @@
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
+import 'dart:convert';
 import '../models/system_log.dart';
 import 'log_service.dart';
 
@@ -20,7 +21,7 @@ class DatabaseService {
       
       return await openDatabase(
         path,
-        version: 6,
+        version: 7,
         onCreate: _onCreate,
         onUpgrade: _onUpgrade,
         onOpen: (db) async {
@@ -179,6 +180,40 @@ class DatabaseService {
         )
       ''');
       print('知识库相关表已创建');
+    }
+    
+    // 版本7: 对话相关表
+    if (oldVersion < 7) {
+      await db.execute('''
+        CREATE TABLE conversations (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          agent_id INTEGER,
+          is_pinned INTEGER DEFAULT 0,
+          metadata TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY(agent_id) REFERENCES ai_agents(id) ON DELETE SET NULL
+        )
+      ''');
+      await db.execute('''
+        CREATE TABLE chat_messages (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          conversation_id TEXT NOT NULL,
+          content TEXT NOT NULL,
+          is_user INTEGER NOT NULL,
+          agent_name TEXT,
+          metadata TEXT,
+          is_error INTEGER DEFAULT 0,
+          can_retry INTEGER DEFAULT 0,
+          attached_files TEXT,
+          is_editing INTEGER DEFAULT 0,
+          original_content TEXT,
+          timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        )
+      ''');
+      print('对话相关表已创建');
     }
   }
   
@@ -1102,6 +1137,259 @@ class DatabaseService {
       return count;
     } catch (e) {
       print('更新分块失败: $e');
+      rethrow;
+    }
+  }
+
+  // ==================== 对话相关操作 ====================
+
+  /// 创建新对话
+  static Future<String> createConversation({
+    required String title,
+    int? agentId,
+    Map<String, dynamic>? metadata,
+  }) async {
+    try {
+      final db = await database;
+      final conversationId = DateTime.now().millisecondsSinceEpoch.toString();
+      
+      await db.insert('conversations', {
+        'id': conversationId,
+        'title': title,
+        'agent_id': agentId,
+        'is_pinned': 0,
+        'metadata': metadata != null ? jsonEncode(metadata) : null,
+        'created_at': DateTime.now().toIso8601String(),
+        'last_updated': DateTime.now().toIso8601String(),
+      });
+      
+      print('对话已创建: $conversationId - $title');
+      return conversationId;
+    } catch (e) {
+      print('创建对话失败: $e');
+      rethrow;
+    }
+  }
+
+  /// 获取所有对话
+  static Future<List<Map<String, dynamic>>> getAllConversations() async {
+    try {
+      final db = await database;
+      final result = await db.query(
+        'conversations',
+        orderBy: 'is_pinned DESC, last_updated DESC',
+      );
+      
+      return result.map((row) {
+        final metadata = row['metadata'] as String?;
+        return {
+          ...row,
+          'metadata': metadata != null ? jsonDecode(metadata) : null,
+        };
+      }).toList();
+    } catch (e) {
+      print('获取对话列表失败: $e');
+      return [];
+    }
+  }
+
+  /// 获取对话详情
+  static Future<Map<String, dynamic>?> getConversation(String conversationId) async {
+    try {
+      final db = await database;
+      final result = await db.query(
+        'conversations',
+        where: 'id = ?',
+        whereArgs: [conversationId],
+        limit: 1,
+      );
+      
+      if (result.isEmpty) return null;
+      
+      final row = result.first;
+      final metadata = row['metadata'] as String?;
+      return {
+        ...row,
+        'metadata': metadata != null ? jsonDecode(metadata) : null,
+      };
+    } catch (e) {
+      print('获取对话详情失败: $e');
+      return null;
+    }
+  }
+
+  /// 更新对话标题
+  static Future<int> updateConversationTitle(String conversationId, String title) async {
+    try {
+      final db = await database;
+      final count = await db.update(
+        'conversations',
+        {
+          'title': title,
+          'last_updated': DateTime.now().toIso8601String(),
+        },
+        where: 'id = ?',
+        whereArgs: [conversationId],
+      );
+      
+      print('对话标题已更新: $conversationId - $title');
+      return count;
+    } catch (e) {
+      print('更新对话标题失败: $e');
+      rethrow;
+    }
+  }
+
+  /// 切换对话置顶状态
+  static Future<int> toggleConversationPin(String conversationId) async {
+    try {
+      final db = await database;
+      
+      // 先获取当前状态
+      final result = await db.query(
+        'conversations',
+        columns: ['is_pinned'],
+        where: 'id = ?',
+        whereArgs: [conversationId],
+        limit: 1,
+      );
+      
+      if (result.isEmpty) return 0;
+      
+      final currentPin = result.first['is_pinned'] as int;
+      final newPin = currentPin == 1 ? 0 : 1;
+      
+      final count = await db.update(
+        'conversations',
+        {
+          'is_pinned': newPin,
+          'last_updated': DateTime.now().toIso8601String(),
+        },
+        where: 'id = ?',
+        whereArgs: [conversationId],
+      );
+      
+      print('对话置顶状态已切换: $conversationId - ${newPin == 1 ? '置顶' : '取消置顶'}');
+      return count;
+    } catch (e) {
+      print('切换对话置顶状态失败: $e');
+      rethrow;
+    }
+  }
+
+  /// 删除对话
+  static Future<int> deleteConversation(String conversationId) async {
+    try {
+      final db = await database;
+      
+      // 先删除相关消息
+      await db.delete(
+        'chat_messages',
+        where: 'conversation_id = ?',
+        whereArgs: [conversationId],
+      );
+      
+      // 再删除对话
+      final count = await db.delete(
+        'conversations',
+        where: 'id = ?',
+        whereArgs: [conversationId],
+      );
+      
+      print('对话已删除: $conversationId');
+      return count;
+    } catch (e) {
+      print('删除对话失败: $e');
+      rethrow;
+    }
+  }
+
+  /// 添加聊天消息
+  static Future<int> addChatMessage({
+    required String conversationId,
+    required String content,
+    required bool isUser,
+    String? agentName,
+    Map<String, dynamic>? metadata,
+    bool isError = false,
+    bool canRetry = false,
+    List<String>? attachedFiles,
+    bool isEditing = false,
+    String? originalContent,
+  }) async {
+    try {
+      final db = await database;
+      
+      final messageId = await db.insert('chat_messages', {
+        'conversation_id': conversationId,
+        'content': content,
+        'is_user': isUser ? 1 : 0,
+        'agent_name': agentName,
+        'metadata': metadata != null ? jsonEncode(metadata) : null,
+        'is_error': isError ? 1 : 0,
+        'can_retry': canRetry ? 1 : 0,
+        'attached_files': attachedFiles != null ? jsonEncode(attachedFiles) : null,
+        'is_editing': isEditing ? 1 : 0,
+        'original_content': originalContent,
+        'timestamp': DateTime.now().toIso8601String(),
+      });
+      
+      // 更新对话的最后更新时间
+      await db.update(
+        'conversations',
+        {'last_updated': DateTime.now().toIso8601String()},
+        where: 'id = ?',
+        whereArgs: [conversationId],
+      );
+      
+      print('消息已添加: 对话 $conversationId');
+      return messageId;
+    } catch (e) {
+      print('添加消息失败: $e');
+      rethrow;
+    }
+  }
+
+  /// 获取对话的所有消息
+  static Future<List<Map<String, dynamic>>> getConversationMessages(String conversationId) async {
+    try {
+      final db = await database;
+      final result = await db.query(
+        'chat_messages',
+        where: 'conversation_id = ?',
+        whereArgs: [conversationId],
+        orderBy: 'timestamp ASC',
+      );
+      
+      return result.map((row) {
+        final metadata = row['metadata'] as String?;
+        final attachedFiles = row['attached_files'] as String?;
+        return {
+          ...row,
+          'metadata': metadata != null ? jsonDecode(metadata) : null,
+          'attached_files': attachedFiles != null ? jsonDecode(attachedFiles) : null,
+        };
+      }).toList();
+    } catch (e) {
+      print('获取对话消息失败: $e');
+      return [];
+    }
+  }
+
+  /// 删除所有对话历史
+  static Future<void> deleteAllConversations() async {
+    try {
+      final db = await database;
+      
+      // 删除所有消息
+      await db.delete('chat_messages');
+      
+      // 删除所有对话
+      await db.delete('conversations');
+      
+      print('所有对话历史已删除');
+    } catch (e) {
+      print('删除所有对话历史失败: $e');
       rethrow;
     }
   }

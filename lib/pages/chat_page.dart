@@ -16,7 +16,8 @@ import '../services/database_service.dart';
 import '../services/ai_agent_service.dart';
 import '../services/log_service.dart';
 import '../services/rag_service.dart';
-import '../services/file_upload_service.dart';
+
+import '../services/conversation_title_service.dart';
 
 /// 选中的文件信息
 class SelectedFile {
@@ -98,6 +99,10 @@ class _ChatPageState extends State<ChatPage> with SingleTickerProviderStateMixin
   
   // 文件管理
   List<SelectedFile> _selectedFiles = [];
+  
+  // UI 控制
+  bool _showTechnicalInfo = false; // 是否显示技术信息
+  String? _selectedMessageId; // 当前选中的消息ID，用于在右侧面板显示技术信息
 
   @override
   void initState() {
@@ -105,7 +110,7 @@ class _ChatPageState extends State<ChatPage> with SingleTickerProviderStateMixin
     _loadAvailableAgents();
     _loadModelProviders();
     _loadKnowledgeBases();
-    _loadSavedConversations();
+    _loadConversations(); // 使用新的数据库加载方法
     
     // 监听输入框变化，用于动态更新发送按钮状态
     _messageController.addListener(() {
@@ -179,6 +184,59 @@ class _ChatPageState extends State<ChatPage> with SingleTickerProviderStateMixin
       }
     } catch (e) {
       print('加载对话记录失败: $e');
+    }
+  }
+
+  /// 加载对话列表
+  Future<void> _loadConversations() async {
+    try {
+      final conversations = await DatabaseService.getAllConversations();
+      final conversationList = <Conversation>[];
+      
+      for (final data in conversations) {
+        // 获取对话的消息
+        final messages = await DatabaseService.getConversationMessages(data['id']);
+        final chatMessages = messages.map((msg) => ChatMessage(
+          content: msg['content'] as String,
+          isUser: (msg['is_user'] as int) == 1,
+          timestamp: DateTime.parse(msg['timestamp'] as String),
+          agentName: msg['agent_name'] as String?,
+          metadata: msg['metadata'] as Map<String, dynamic>?,
+          isError: (msg['is_error'] as int) == 1,
+          canRetry: (msg['can_retry'] as int) == 1,
+          attachedFiles: (msg['attached_files'] as List<dynamic>?)?.map((f) => File(f as String)).toList(),
+          isEditing: (msg['is_editing'] as int) == 1,
+          originalContent: msg['original_content'] as String?,
+        )).toList();
+        
+        // 获取关联的代理信息
+        AIAgent? agent;
+        if (data['agent_id'] != null) {
+          final agentData = await DatabaseService.getAIAgentById(data['agent_id'] as int);
+          if (agentData != null) {
+            agent = AIAgent.fromMap(agentData);
+          }
+        }
+        
+        final conversation = Conversation(
+          id: data['id'] as String,
+          title: data['title'] as String,
+          agent: agent,
+          createdAt: DateTime.parse(data['created_at'] as String),
+          lastUpdated: DateTime.parse(data['last_updated'] as String),
+          messages: chatMessages,
+          isPinned: (data['is_pinned'] as int) == 1,
+          metadata: data['metadata'] as Map<String, dynamic>?,
+        );
+        
+        conversationList.add(conversation);
+      }
+      
+      setState(() {
+        _conversations = conversationList;
+      });
+    } catch (e) {
+      print('加载对话列表失败: $e');
     }
   }
 
@@ -522,6 +580,42 @@ class _ChatPageState extends State<ChatPage> with SingleTickerProviderStateMixin
     if (_currentConversation == null) {
       _createConversationWithAgent(_selectedAgent);
     }
+    
+    // 准备文件列表（在try块外部定义，以便catch块可以访问）
+    List<File> filesToUpload = [];
+    
+    // 先处理文件列表，为生成标题做准备
+    if (_selectedFiles.isNotEmpty) {
+      for (int i = 0; i < _selectedFiles.length; i++) {
+        final selectedFile = _selectedFiles[i];
+        final file = File(selectedFile.path);
+        final exists = await file.exists();
+        if (exists) {
+          filesToUpload.add(file);
+        }
+      }
+    }
+    
+    // 检查是否需要生成对话标题（第一条用户消息）
+    final isFirstUserMessage = _messages.where((m) => m.isUser).isEmpty;
+    if (isFirstUserMessage && _currentConversation != null) {
+      // 生成智能标题
+      final generatedTitle = ConversationTitleService.generateTitle(message, filesToUpload);
+      print('生成对话标题: $generatedTitle');
+      
+      // 更新数据库中的对话标题
+      await DatabaseService.updateConversationTitle(_currentConversation!.id, generatedTitle);
+      
+      // 更新内存中的对话标题
+      setState(() {
+        _currentConversation = _currentConversation!.copyWith(title: generatedTitle);
+        // 更新对话列表中的对应项
+        final index = _conversations.indexWhere((c) => c.id == _currentConversation!.id);
+        if (index != -1) {
+          _conversations[index] = _currentConversation!;
+        }
+      });
+    }
 
     final userMessage = ChatMessage(
       content: fullMessage,
@@ -536,9 +630,16 @@ class _ChatPageState extends State<ChatPage> with SingleTickerProviderStateMixin
     
     _messageController.clear();
     _scrollToBottom();
-
-    // 准备文件列表（在try块外部定义，以便catch块可以访问）
-    List<File> filesToUpload = [];
+    
+    // 保存用户消息到数据库
+    if (_currentConversation != null) {
+      await DatabaseService.addChatMessage(
+        conversationId: _currentConversation!.id,
+        content: fullMessage,
+        isUser: true,
+        attachedFiles: filesToUpload.map((f) => f.path).toList(),
+      );
+    }
     
     try {
       // 如果没有选择代理且没有配置提供商，显示提示信息
@@ -591,29 +692,7 @@ class _ChatPageState extends State<ChatPage> with SingleTickerProviderStateMixin
       // 确保有可用的代理
       agentToUse ??= _createDefaultAgent();
 
-      // 准备文件列表
-      print('准备文件上传列表...');
-      print('_selectedFiles数量: ${_selectedFiles.length}');
-      
-      if (_selectedFiles.isNotEmpty) {
-        for (int i = 0; i < _selectedFiles.length; i++) {
-          final selectedFile = _selectedFiles[i];
-          print('处理文件 $i: ${selectedFile.name}');
-          print('文件路径: ${selectedFile.path}');
-          
-          final file = File(selectedFile.path);
-          final exists = await file.exists();
-          print('文件是否存在: $exists');
-          
-          if (exists) {
-            filesToUpload.add(file);
-            print('文件已添加到上传列表');
-          } else {
-            print('文件不存在，跳过');
-          }
-        }
-      }
-      
+      // 文件列表已在前面处理完成
       print('最终上传文件数量: ${filesToUpload.length}');
 
       // 发送前记录本次使用的具体代理信息
@@ -1239,9 +1318,56 @@ class _ChatPageState extends State<ChatPage> with SingleTickerProviderStateMixin
               ),
             ),
           ),
+
+          // 悬浮设置按钮
+          Positioned(
+            top: 20,
+            right: 20,
+            child: Container(
+              decoration: BoxDecoration(
+                color: themeProvider.surfaceColor,
+                borderRadius: BorderRadius.circular(12),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.1),
+                    blurRadius: 8,
+                    offset: const Offset(0, 2),
+                  ),
+                ],
+                border: Border.all(
+                  color: themeProvider.borderColor,
+                  width: 1,
+                ),
+              ),
+              child: IconButton(
+                tooltip: _showRightPanel ? '关闭 AI 配置' : '打开 AI 配置',
+                onPressed: () {
+                  setState(() {
+                    _showRightPanel = !_showRightPanel;
+                    if (_showRightPanel) {
+                      _panelAnimController.forward();
+                    } else {
+                      _panelAnimController.reverse();
+                    }
+                  });
+                },
+                icon: Icon(
+                  Icons.settings,
+                  color: _showRightPanel ? themeProvider.primaryColor : themeProvider.textSecondaryColor,
+                  size: 20,
+                ),
+                padding: const EdgeInsets.all(12),
+                constraints: const BoxConstraints(
+                  minWidth: 44,
+                  minHeight: 44,
+                ),
+              ),
+            ),
+          ),
+
+
         ],
       ),
-      // 顶部右侧提供触发按钮，不再使用右下角悬浮按钮
     );
   }
 
@@ -1402,20 +1528,7 @@ class _ChatPageState extends State<ChatPage> with SingleTickerProviderStateMixin
   Widget _buildCenterPanel(ThemeProvider themeProvider) {
     return Column(
       children: [
-        // 对话头部
-        Container(
-          padding: const EdgeInsets.all(20),
-          decoration: BoxDecoration(
-            color: themeProvider.surfaceColor,
-            border: Border(
-              bottom: BorderSide(
-                color: themeProvider.borderColor,
-                width: 1,
-              ),
-            ),
-          ),
-          child: _buildConversationHeader(themeProvider),
-        ),
+
         
         // 消息列表
         Expanded(
@@ -1912,31 +2025,7 @@ class _ChatPageState extends State<ChatPage> with SingleTickerProviderStateMixin
                   
                   // 成功消息显示元数据
                   if (!message.isError && message.metadata != null)
-                    Container(
-                      margin: const EdgeInsets.only(top: 8),
-                      child: Row(
-                        children: [
-                          if (message.metadata!['responseTime'] != null)
-                            _buildMetadataItem(
-                              Icons.timer,
-                              '${message.metadata!['responseTime']}ms',
-                              themeProvider,
-                            ),
-                          if (message.metadata!['tokenUsage'] != null)
-                            _buildMetadataItem(
-                              Icons.token,
-                              '${message.metadata!['tokenUsage']} tokens',
-                              themeProvider,
-                            ),
-                          if (message.metadata!['cost'] != null)
-                            _buildMetadataItem(
-                              Icons.attach_money,
-                              '\$${message.metadata!['cost']}',
-                              themeProvider,
-                            ),
-                        ],
-                      ),
-                    ),
+                    Container(), // 技术信息已移动到右侧面板，这里不再显示
                 ],
               ),
             ),
@@ -2707,10 +2796,24 @@ class _ChatPageState extends State<ChatPage> with SingleTickerProviderStateMixin
   }
 
   /// 使用指定代理创建对话
-  void _createConversationWithAgent(AIAgent? agent) {
+  void _createConversationWithAgent(AIAgent? agent) async {
+    // 创建临时对话，等待用户发送第一条消息时生成标题
+    final conversationId = DateTime.now().millisecondsSinceEpoch.toString();
+    final tempTitle = agent?.name ?? '新对话';
+    
+    // 在数据库中创建对话
+    await DatabaseService.createConversation(
+      title: tempTitle,
+      agentId: agent?.id,
+      metadata: {
+        'is_temp': true, // 标记为临时对话，等待第一条消息后更新标题
+        'agent_name': agent?.name,
+      },
+    );
+
     final conversation = Conversation(
-      id: DateTime.now().millisecondsSinceEpoch.toString(),
-      title: agent?.name ?? '通用助手对话',
+      id: conversationId,
+      title: tempTitle,
       agent: agent,
       createdAt: DateTime.now(),
       lastUpdated: DateTime.now(),
@@ -2723,7 +2826,9 @@ class _ChatPageState extends State<ChatPage> with SingleTickerProviderStateMixin
       _selectedAgent = agent;
       _messages.clear();
     });
-    _persistConversations();
+    
+    // 加载对话列表
+    _loadConversations();
   }
 
   /// 创建默认通用助手代理
@@ -3151,62 +3256,138 @@ class _ChatPageState extends State<ChatPage> with SingleTickerProviderStateMixin
             ],
           ),
         ),
-        // 供应商/模型信息 + 设置按钮
-        Row(
-          children: [
-            if (_selectedProvider != null)
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                decoration: BoxDecoration(
-                  color: themeProvider.primaryColor.withOpacity(0.1),
-                  borderRadius: BorderRadius.circular(20),
-                ),
-                child: Row(
-                  children: [
-                    Icon(Icons.apartment, size: 16, color: themeProvider.primaryColor),
-                    const SizedBox(width: 6),
-                    Text(
-                      _selectedProvider!.providerType.displayName,
-                      style: TextStyle(color: themeProvider.primaryColor, fontSize: 12),
-                    ),
-                  ],
-                ),
-              ),
-            const SizedBox(width: 8),
-            if (_selectedModel != null)
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                decoration: BoxDecoration(
-                  color: themeProvider.surfaceColor,
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(color: themeProvider.borderColor),
-                ),
-                child: Row(
-                  children: [
-                    Icon(Icons.model_training, size: 16, color: themeProvider.textSecondaryColor),
-                    const SizedBox(width: 6),
-                    Text(_selectedModel!, style: TextStyle(color: themeProvider.textSecondaryColor, fontSize: 12)),
-                  ],
-                ),
-              ),
-            const SizedBox(width: 12),
-            IconButton(
-              tooltip: _showRightPanel ? '关闭 AI 配置' : '打开 AI 配置',
-              onPressed: () {
-                setState(() {
-                  _showRightPanel = !_showRightPanel;
-                  if (_showRightPanel) {
-                    _panelAnimController.forward();
-                  } else {
-                    _panelAnimController.reverse();
-                  }
-                });
-              },
-              icon: Icon(Icons.settings, color: _showRightPanel ? themeProvider.primaryColor : themeProvider.textSecondaryColor),
-            ),
-          ],
-        ),
       ],
+    );
+  }
+
+  /// 构建技术信息卡片
+  Widget _buildTechnicalInfoCard(ThemeProvider themeProvider) {
+    return Container(
+      margin: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: themeProvider.isDarkMode 
+            ? const Color(0xFF1A1A1A) 
+            : const Color(0xFFF0F8FF),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: themeProvider.primaryColor.withOpacity(0.2),
+          width: 1,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                Icons.info_outline,
+                size: 16,
+                color: themeProvider.primaryColor,
+              ),
+              const SizedBox(width: 8),
+              Text(
+                '当前配置',
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  color: themeProvider.primaryColor,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          
+          // 供应商信息
+          if (_selectedProvider != null)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              margin: const EdgeInsets.only(bottom: 8),
+              decoration: BoxDecoration(
+                color: themeProvider.primaryColor.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.apartment,
+                    size: 16,
+                    color: themeProvider.primaryColor,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      _selectedProvider!.providerType.displayName,
+                      style: TextStyle(
+                        color: themeProvider.primaryColor,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          
+          // 模型信息
+          if (_selectedModel != null)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: themeProvider.surfaceColor,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: themeProvider.borderColor,
+                  width: 1,
+                ),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.model_training,
+                    size: 16,
+                    color: themeProvider.textSecondaryColor,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      _selectedModel!,
+                      style: TextStyle(
+                        color: themeProvider.textSecondaryColor,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          
+          // 如果没有选择任何配置，显示提示
+          if (_selectedProvider == null && _selectedModel == null)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: themeProvider.surfaceColor,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: themeProvider.borderColor,
+                  width: 1,
+                ),
+              ),
+              child: Text(
+                '请在下方配置中选择模型提供商和模型',
+                style: TextStyle(
+                  color: themeProvider.textSecondaryColor,
+                  fontSize: 12,
+                ),
+              ),
+            ),
+        ],
+      ),
     );
   }
 
@@ -3214,6 +3395,9 @@ class _ChatPageState extends State<ChatPage> with SingleTickerProviderStateMixin
   Widget _buildConfigurationTabs(ThemeProvider themeProvider) {
     return Column(
       children: [
+        // 技术信息显示区域
+        _buildTechnicalInfoCard(themeProvider),
+        
         // 标签页头部
         Container(
           padding: const EdgeInsets.all(20),
